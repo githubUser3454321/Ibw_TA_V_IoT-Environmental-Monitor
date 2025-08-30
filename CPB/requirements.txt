@@ -1,10 +1,6 @@
-# requirements.txt für Raspberry Pi (Python-Seite)
-# Installiere alles mit: pip install -r requirements.txt
+# Hinweis: CircuitPython verwendet das Adafruit Library Bundle (Dateien in CIRCUITPY/lib/).
+# Diese requirements.txt dient nur der Dokumentation bzw. fuer lokale Tools/Type-Checker.
 
-bleak
-adafruit-io
-
-# Adafruit CircuitPython Libraries (für Kompatibilität mit den CPB-Libs)
 adafruit-circuitpython-ble
 adafruit-circuitpython-lis3dh
 adafruit-circuitpython-thermistor

@@ -1,91 +1,94 @@
-# README – TA V CPB Sensor Node + Cloud-LED-Steuerung
+# TA V – CPB Sensor Node + Cloud-LED-Steuerung (BLE-UART Bridge)
 
-## 1 Einleitung
-Dieses Dokument beschreibt den Aufbau und die Nutzung des Codes für das IoT-Projekt im Rahmen der Transferaufgabe V.  
-Der Code läuft auf dem **Adafruit Circuit Playground Bluefruit (CPB)** und kommuniziert per Bluetooth Low Energy (BLE) mit einem **Raspberry Pi**.  
-Der Raspberry Pi leitet die Sensordaten an eine IoT-Cloud (z. B. Adafruit IO) weiter und überträgt Steuerbefehle aus der Cloud an den CPB.
+**Kurzfassung:** Circuit Playground Bluefruit (CPB) sendet Sensorwerte als CSV ueber **BLE UART** an einen Raspberry Pi (Central/Bridge) und nimmt **Textkommandos** fuer NeoPixel entgegen. Ausgelegt auf **bewertbare Kriterien**: Nachweisbarkeit (seq/Einheiten), Robustheit (Rate-Limit, Watchdog optional), Testbarkeit (SELFTEST, PING), Dokumentation (INFO/Heartbeat).
 
----
+## Features
+- 3 Sensoren: Licht (raw), Temperatur (C), Beschleunigung (m/s^2)
+- CSV-Frames mit **Sequenznummer**, **Zeit in ms**, **Einheiten**, optional **Batteriespannung**
+- Steuerkommandos: `FILL`, `PIX`, `BRI`, `RATE`, `PING`, `SELFTEST?`, `INFO?`
+- **Heartbeat** alle 30 s, **Rate-Limit** fuer Kommandos (20/s), **optional Watchdog**
 
-## 2 Ziel und Zweck
-- Erfassen von mindestens **zwei Umweltsensoren** (Licht, Temperatur, Bewegung) auf dem CPB.  
-- Übertragung dieser Daten über BLE → Raspberry Pi → WLAN/Ethernet → IoT-Cloud.  
-- **Darstellung der Sensordaten als Zeitreihe** in der Cloud (z. B. Dashboard/Charts).  
-- **Fernsteuerung der NeoPixel-LEDs** aus der Cloud (Farbe, Helligkeit).
+## Hardware / Software
+- Board: Adafruit Circuit Playground Bluefruit (nRF52840)
+- Firmware: CircuitPython (empfohlen: aktuelle 8.x/9.x)
+- Lib-Bundle (in `CIRCUITPY/lib/`):
+  - `adafruit_ble`, `adafruit_lis3dh`, `adafruit_thermistor`, `neopixel`
 
----
+## Übersicht verwendeter Sensoren (CPB)
 
-## 3 Datenfluss
+| Sensor             | Code-Stelle                                      | Messwert                     | Einheit       |
+|--------------------|--------------------------------------------------|-------------------------------|---------------|
+| **Lichtsensor**    | `light = analogio.AnalogIn(board.LIGHT)`         | `light.value` (Rohwert)       | 0 … 65535     |
+| **Temperatur**     | `therm = adafruit_thermistor.Thermistor(...)`    | `therm.temperature`           | °C            |
+| **Beschleunigung** | `lis = adafruit_lis3dh.LIS3DH_I2C(i2c)`          | `lis.acceleration` → ax,ay,az | m/s²          |
+| **Batteriespannung (optional)** | `vbat = analogio.AnalogIn(board.VOLTAGE_MONITOR)` | `read_battery_mV()`           | mV (oder -1)  |
+
+
+## Deployment auf das Board
+1. CircuitPython auf das CPB flashen.
+2. Adafruit CircuitPython **Library Bundle** entpacken, benoetigte Ordner nach `CIRCUITPY/lib/` kopieren.
+3. Diese Datei als `code.py` auf `CIRCUITPY/` kopieren.
+4. Nach Reset erscheint das Geraet per BLE als **`CPB_TA_V`**.
+
+## Protokoll
+
+**Infozeile (bei Connect oder `INFO?`):**
 ```
-CPB (BLE UART Peripheral)
-    <-> Raspberry Pi (BLE Central / IoT-Bridge)
-        <-> IoT-Cloud (Adafruit IO)
+INFO,CPB,TA-V,<FW_VERSION>,<BUILD_DATE>,NODE=<id>,PIX=10,CMDS=FILL|PIX|BRI|RATE|INFO?|SELFTEST?|PING
 ```
 
----
-
-## 4 Funktionsumfang
-
-### 4.1 Sendedaten (Sensordaten vom CPB)
-Format (CSV, 1 Hz):
+**Heartbeat (alle 30 s):**
 ```
-SENS,<ms>,<light_raw>,<temp_C>,<ax>,<ay>,<az>
-```
-Beispiel:
-```
-SENS,12345,240,22.37,0.001,-0.054,9.812
+HB,ms=<now_ms>,node=<id>,ver=<FW_VERSION>
 ```
 
-### 4.2 Empfangskommandos (vom Pi / Cloud an CPB)
-- `FILL,<r>,<g>,<b>` – Setzt alle NeoPixel auf eine Farbe  
-- `PIX,<index>,<r>,<g>,<b>` – Setzt ein einzelnes NeoPixel  
-- `BRI,<0-100>` – Helligkeit aller NeoPixel einstellen  
-- `INFO?` – Liefert eine Infozeile mit Boarddaten zurück
-
----
-
-## 5 Installation
-
-### 5.1 Circuit Playground Bluefruit (CPB)
-1. CircuitPython installieren: [circuitpython.org](https://circuitpython.org/board/circuitplayground_bluefruit/)  
-2. Im Ordner `/lib` folgende Libraries ablegen:
-   - `adafruit_ble`
-   - `adafruit_lis3dh.mpy`
-   - `adafruit_thermistor.mpy`
-   - `neopixel.mpy`
-3. Datei `code.py` auf den CPB kopieren.  
-
-### 5.2 Raspberry Pi
-1. Python 3 installieren.  
-2. Dependencies via pip installieren:
-```bash
-pip install -r requirements_full.txt
+**Sensorframe (Standard 1 Hz, per `RATE` aenderbar):**
 ```
-3. Enthaltene Pakete:
-   - `bleak` (BLE Kommunikation)  
-   - `adafruit-io` (Cloud-Anbindung)  
-   - `adafruit-circuitpython-ble`  
-   - `adafruit-circuitpython-lis3dh`  
-   - `adafruit-circuitpython-thermistor`  
-   - `adafruit-circuitpython-neopixel`  
+SENS,seq=<n>,ms=<t>,light_raw=<int>,light_f=<float>,temp_C=<float>,ax_ms2=<f>,ay_ms2=<f>,az_ms2=<f>,ax_f=<f>,ay_f=<f>,az_f=<f>,batt_mV=<int>
+```
+- `seq`: Sequenznummer ab 1
+- `ms`: Monotonic-Time in Millisekunden (vom CPB)
+- `*_f`: geglaettete Werte (EMA, alpha=0.2)
+- `batt_mV`: -1 wenn nicht verfuegbar
 
----
+**Kommandos (CSV, endet mit `\n`):**
+- `FILL,<r>,<g>,<b>` – alle Pixel setzen (0..255)
+- `PIX,<i>,<r>,<g>,<b>` – Pixel `i` setzen (0..9)
+- `BRI,<0-100>` – Helligkeit in Prozent
+- `RATE,<Hz>` – 0.2 .. 5.0 Hz Messrate
+- `SELFTEST?` – prueft Sensor-Read und 1 Pixel, Rueckgabe: `SELFTEST,OK/ERR,...`
+- `PING` – Rueckgabe: `OK,PING,ms=<now_ms>`
+- `INFO?` – Infozeile erneut senden
 
-## 6 Nutzung
-1. Raspberry Pi startet das Bridge-Skript (stellt BLE-Verbindung her und verbindet zur Cloud).  
-2. CPB sendet Sensordaten automatisch alle 1 Sekunde.  
-3. Raspberry Pi publiziert Daten in der IoT-Cloud.  
-4. Cloud-Befehle werden vom Pi empfangen und via BLE an das CPB weitergereicht, wodurch die NeoPixel gesteuert werden.
+**Antworten:**
+- Erfolg: `OK,<TAG>,ms=<now_ms>[,extra]`
+- Fehler: `ERR,<TAG>,ms=<now_ms>[,reason]`
 
----
+## Bezug zu Beurteilungskriterien
 
-## 7 Hinweise
-- Eindeutiger BLE-Name des Boards: **CPB_TA_V**  
-- Standard-Sensorrate: 1 Hz (konfigurierbar in `SENS_INTERVAL`)  
-- Erweiterungen: Weitere Sensoren oder zusätzliche Befehle können einfach ergänzt werden.
+- **Zielerreichung**: 2+ Sensoren, 1 Hz, CSV-Protokoll, LED-Steuerung – per Screencast/Log nachweisbar.
+- **Nachvollziehbarkeit**: `seq`, `ms`, Einheiten, `INFO` mit `NODE_ID`, `FW_VERSION`, `BUILD_DATE`.
+- **Robustheit**: optionaler Watchdog, Reconnect-Loop, Rate-Limit, Fehlercodes.
+- **Testbarkeit**: `SELFTEST?`, `PING`, standardisierte `OK/ERR`; Heartbeat fuer Dauerlauf.
+- **Sicherheit/Ordnung**: Board-Name eindeutig, Eingangsvalidierung (clamp), Index-Check, BRI-Clamp.
 
----
+## Beispiel-Logs
 
-## 8 Autor
-Fabio Panteghini  
-August 2025  
+```
+INFO,CPB,TA-V,1.1.0,2025-08-30,NODE=CPB-01,PIX=10,CMDS=FILL|PIX|BRI|RATE|INFO?|SELFTEST?|PING
+OK,BRI,ms=123456,Brightness=
+OK,RATE,ms=124001,Hz=2.00
+SENS,seq=1,ms=124500,light_raw=23456,light_f=23456.0,temp_C=23.12,ax_ms2=-0.100,ay_ms2=0.010,az_ms2=9.810,ax_f=-0.100,ay_f=0.010,az_f=9.810,batt_mV=4100
+OK,FILL,ms=125000
+HB,ms=154500,node=CPB-01,ver=1.1.0
+```
+
+## Pi-Bridge (Hinweis)
+- Central verbindet auf Geraetename `CPB_TA_V`, liest UART-Zeilen und publiziert in Cloud-Feeds.
+- Rueckkanal: Cloud-Feed -> Pi -> BLE UART (z. B. `FILL,0,10,0\n`).
+- `PING` eignet sich zur Latenzmessung Cloud->CPB.
+
+## Troubleshooting
+- Keine Verbindung: Pruefen, ob andere Central bereits verbunden ist. Reset des CPB.
+- Keine Libraries gefunden: Adafruit Bundle-Version passend zur CircuitPython-Version verwenden.
+- Batteriespannung -1: Board hat keinen `VOLTAGE_MONITOR` oder Pin nicht verfuegbar.
