@@ -1,0 +1,11 @@
+# requirements.txt für Raspberry Pi (Python-Seite)
+# Installiere alles mit: pip install -r requirements.txt
+
+bleak
+adafruit-io
+
+# Adafruit CircuitPython Libraries (für Kompatibilität mit den CPB-Libs)
+adafruit-circuitpython-ble
+adafruit-circuitpython-lis3dh
+adafruit-circuitpython-thermistor
+adafruit-circuitpython-neopixel
