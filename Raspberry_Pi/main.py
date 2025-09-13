@@ -1,38 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#"""
-#Raspberry Pi BLE Central fuer Adafruit CPB (BLE UART):
-# - Verbindet sich mit dem CPB (Advertise-Name: CPB_TA_V)
-# - Abonniert NUS-Notifications und druckt empfangene Textzeilen
-# - Optional: Eingaben aus der Konsole werden als Befehle an den CPB gesendet
-#"""
-
-import asyncio
-import sys
-import signal
-import json
-import re
+import asyncio, sys, signal, json, re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+
 from bleak import BleakClient, BleakScanner, BleakError
 import aiohttp
+
+# --- Windows: Bleak mag den Selector-Loop ---
+if sys.platform.startswith("win"):
+    try:
+        import asyncio as _asyncio
+        _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 # Nordic UART Service (NUS) UUIDs
 UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 UART_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write (Pi -> CPB)
 UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify (CPB -> Pi)
-# Der in deinem CPB-Code gesetzte Anzeigename:
 TARGET_NAME = "CPB_TA_V"
 
-# API Destination
 API_BASE = "http://localhost:8123"
 API_TELEMETRY = f"{API_BASE}/telemetry"
 
-# API Parser
-_KV_RE = re.compile(r"([A-Za-z_]+)\s*[:=]\s*([-+]?\d+\.?\d*)")
-
-
-
+# --- Parser: toleranter ---
+# Erfasst temp / t / temperatureC sowie x/y/z, egal ob ":" oder "=" oder Leerzeichen.
+_TOKEN_RE = re.compile(r"(temperaturec|temperature|temp|t|x|y|z)\s*[:=\s]\s*([-+]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -40,18 +34,14 @@ def _now_iso() -> str:
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
-def _norm_keys(d: Dict[str, Any]) -> Dict[str, Any]:
-    return {str(k).strip().lower(): v for k, v in d.items()}
-
-def parse_line(line: str) -> Optional[Dict[str, Any]]:
+def parse_line(line: str, last: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Versucht mehrere Formate:
-      1) JSON mit {temperatureC,temp,t} und {axes:{x,y,z}} oder x,y,z top-level
-      2) Key=Value/Colon: T=.., Temp:.., X:.., Y:.., Z:.., (optional timestamp)
-    Gibt dict im Serverformat zurück: {"temperatureC": float, "axes": {"x":..,"y":..,"z":..}, "timestamp": "..."}
-    oder None (wenn nicht parsebar).
+    Akzeptiert:
+      - JSON: {"temperatureC":..,"axes":{"x":..,"y":..,"z":..}} oder {"temp":..,"x":..,"y":..,"z":..}
+      - Tokens: 'T=37.2 X=10 Y=75 Z=1.8' oder 'temp:37.2 x:10 y:75 z:1.8' oder 't 37.2 x 10 y 75 z 1.8'
+    Fehlende Werte werden mit 'last' aufgefüllt (Partial-Updates erlaubt).
     """
-    line = line.strip()
+    line = (line or "").strip()
     if not line:
         return None
 
@@ -59,122 +49,93 @@ def parse_line(line: str) -> Optional[Dict[str, Any]]:
     if line.startswith("{") and line.endswith("}"):
         try:
             raw = json.loads(line)
-            rawN = _norm_keys(raw)
-            out = {"temperatureC": None, "axes": {"x": None, "y": None, "z": None}, "timestamp": raw.get("timestamp")}
-            # temp
-            for key in ("temperaturec", "temp", "t"):
-                if key in rawN:
-                    out["temperatureC"] = float(rawN[key])
-                    break
-            # axes
-            axes = raw.get("axes")
-            if isinstance(axes, dict):
-                axesN = _norm_keys(axes)
-                for k in ("x", "y", "z"):
-                    if k in axesN:
-                        out["axes"][k] = float(axesN[k])
-            # fallback: top-level x/y/z
-            for k in ("x", "y", "z"):
-                if out["axes"][k] is None and k in rawN:
-                    out["axes"][k] = float(rawN[k])
-
-            # prüfen
-            if out["temperatureC"] is None or None in out["axes"].values():
-                # unvollständig
-                pass
-            else:
-                return _finalize_state(out)
+            t = raw.get("temperatureC") or raw.get("temp") or raw.get("t")
+            axes = raw.get("axes") or {}
+            x = axes.get("x", raw.get("x"))
+            y = axes.get("y", raw.get("y"))
+            z = axes.get("z", raw.get("z"))
+            ts = raw.get("timestamp") or _now_iso()
+            # partials auffüllen
+            t = float(t) if t is not None else last["temperatureC"]
+            x = float(x) if x is not None else last["axes"]["x"]
+            y = float(y) if y is not None else last["axes"]["y"]
+            z = float(z) if z is not None else last["axes"]["z"]
+            return _finalize_state(t, x, y, z, ts)
         except Exception:
             pass
 
-    # 2) Key=Value/Colon
-    pairs = dict((m.group(1).lower(), float(m.group(2))) for m in _KV_RE.finditer(line))
-    if pairs:
-        t = None
-        for key in ("temperaturec", "temp", "t"):
-            if key in pairs:
-                t = pairs[key]
-                break
-        x = pairs.get("x")
-        y = pairs.get("y")
-        z = pairs.get("z")
-        ts_match = re.search(r"timestamp\s*[:=]\s*([^\s;]+)", line, re.IGNORECASE)
-        ts = ts_match.group(1) if ts_match else None
-        if t is not None and x is not None and y is not None and z is not None:
-            return _finalize_state({"temperatureC": t, "axes": {"x": x, "y": y, "z": z}, "timestamp": ts})
+    # 2) Tokens
+    tokens = dict((k.lower(), float(v)) for k, v in _TOKEN_RE.findall(line))
+    if tokens:
+        t = tokens.get("temperaturec") or tokens.get("temperature") or tokens.get("temp") or tokens.get("t")
+        x = tokens.get("x")
+        y = tokens.get("y")
+        z = tokens.get("z")
+        # partials auffüllen
+        t = t if t is not None else last["temperatureC"]
+        x = x if x is not None else last["axes"]["x"]
+        y = y if y is not None else last["axes"]["y"]
+        z = z if z is not None else last["axes"]["z"]
+        return _finalize_state(t, x, y, z, _now_iso())
 
+    # nichts parsebar
     return None
 
-def _finalize_state(s: Dict[str, Any]) -> Dict[str, Any]:
-    t = float(s["temperatureC"])
-    x = float(s["axes"]["x"])
-    y = float(s["axes"]["y"])
-    z = float(s["axes"]["z"])
-    ts = s.get("timestamp") or _now_iso()
-    # clamp gemäß Server
-    t = _clamp(t, -20.0, 60.0)
-    x = _clamp(x, -180.0, 180.0)
-    y = _clamp(y, 0.0, 180.0)
-    z = _clamp(z, 0.4, 5.0)
+def _finalize_state(t, x, y, z, ts):
+    t = _clamp(float(t), -20.0, 60.0)
+    x = _clamp(float(x), -180.0, 180.0)
+    y = _clamp(float(y), 0.0, 180.0)
+    z = _clamp(float(z), 0.4, 5.0)
     return {"temperatureC": t, "axes": {"x": x, "y": y, "z": z}, "timestamp": ts}
 
-# -------- BLE Helfer (wie gehabt) --------
 class LineAssembler:
-    def __init__(self):
-        self._buf = bytearray()
+    def __init__(self): self._buf = bytearray()
     def feed(self, data: bytes):
-        lines = []
+        out = []
         self._buf.extend(data)
         while True:
             try:
-                idx = self._buf.index(0x0A)  # \n
+                i = self._buf.index(0x0A)  # \n
             except ValueError:
                 break
-            chunk = self._buf[:idx]
-            del self._buf[:idx+1]
-            try:
-                lines.append(chunk.decode("utf-8", errors="ignore").rstrip("\r"))
-            except UnicodeDecodeError:
-                pass
-        return lines
+            chunk = self._buf[:i]; del self._buf[:i+1]
+            try: out.append(chunk.decode("utf-8", "ignore").rstrip("\r"))
+            except UnicodeDecodeError: pass
+        return out
 
 async def find_device():
-    print(f"Suche nach CPB (Name: {TARGET_NAME})...")
-    devices = await BleakScanner.discover(timeout=5.0)
-    for d in devices:
+    print(f"Suche nach CPB (Name: {TARGET_NAME})…")
+    devs = await BleakScanner.discover(timeout=5.0)
+    for d in devs:
         if (d.name == TARGET_NAME) or (UART_SERVICE_UUID.lower() in [s.lower() for s in d.metadata.get("uuids", [])]):
             print(f"Gefunden: {d.name} [{d.address}]")
             return d
     return None
 
-async def stdin_to_queue(queue: asyncio.Queue):
+async def stdin_to_queue(q: asyncio.Queue):
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, sys.stdin)
     while True:
         line = await reader.readline()
         if not line:
-            await asyncio.sleep(0.05)
-            continue
-        await queue.put(line.decode("utf-8", errors="ignore").strip())
+            await asyncio.sleep(0.05); continue
+        await q.put(line.decode("utf-8", "ignore").strip())
 
-# ---------------- PUT-Worker (coalescing) ----------------
+# --- PUT-Worker mit sichtbarem Logging ---
 class PutWorker:
     def __init__(self, session: aiohttp.ClientSession, url: str, max_rate_hz: float = 10.0):
         self.session = session
         self.url = url
-        self.queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
         self.latest: Optional[Dict[str, Any]] = None
         self.min_interval = 1.0 / max_rate_hz
         self._task = asyncio.create_task(self._run())
 
     async def submit(self, state: Dict[str, Any]):
-        # Nur den neuesten Zustand behalten (coalescing)
         self.latest = state
 
     async def _run(self):
-        last = 0.0
         try:
             while True:
                 await asyncio.sleep(self.min_interval)
@@ -183,10 +144,10 @@ class PutWorker:
                 payload = self.latest
                 self.latest = None
                 try:
-                    async with self.session.put(self.url, json=payload, timeout=aiohttp.ClientTimeout(total=3)) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            print(f"[PUT] HTTP {resp.status}: {text}")
+                    print(f"[PUT→API] {payload}")  # ### Debug
+                    async with self.session.put(self.url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        txt = await resp.text()
+                        print(f"[API←PUT] {resp.status} {txt[:200]}")  # ### Debug
                 except Exception as e:
                     print(f"[PUT] Fehler: {e}")
         except asyncio.CancelledError:
@@ -194,87 +155,87 @@ class PutWorker:
 
     async def close(self):
         self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
+        try: await self._task
+        except asyncio.CancelledError: pass
 
-# ---------------- Main-Flow ----------------
 async def run():
     stop_event = asyncio.Event()
-
-    def _handle_sigint(*_):
-        print("\nBeende...")
-        stop_event.set()
-    signal.signal(signal.SIGINT, _handle_sigint)
+    def _sigint(*_): print("\nBeende…"); stop_event.set()
+    signal.signal(signal.SIGINT, _sigint)
 
     async with aiohttp.ClientSession() as http:
         put_worker = PutWorker(http, API_TELEMETRY, max_rate_hz=10.0)
+
+        # ### Merker für Partial-Updates
+        current = {"temperatureC": 20.0, "axes": {"x": 0.0, "y": 75.0, "z": 2.0}}
 
         while not stop_event.is_set():
             try:
                 dev = await find_device()
                 if not dev:
-                    print("Kein CPB gefunden. Erneuter Versuch in 3s...")
-                    try:
-                        await asyncio.wait_for(stop_event.wait(), timeout=3.0)
-                    except asyncio.TimeoutError:
-                        continue
+                    print("Kein CPB gefunden. Erneuter Versuch in 3s…")
+                    try: await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+                    except asyncio.TimeoutError: continue
                     break
 
                 async with BleakClient(dev) as client:
                     if not client.is_connected:
-                        print("Konnte nicht verbinden.")
-                        continue
-                    print("Verbunden. Services werden geprüft")
-
+                        print("Konnte nicht verbinden."); continue
+                    print("Verbunden. Services werden geprüft…")
                     svcs = await client.get_services()
                     if UART_SERVICE_UUID.lower() not in [s.uuid.lower() for s in svcs]:
                         print("Warnung: NUS-Service nicht gefunden – falsches Gerät")
                     else:
-                        print("NUS erkannt. Starte Notification-Listener.")
+                        print("NUS erkannt. Starte Notifications.")
 
                     assembler = LineAssembler()
+                    loop = asyncio.get_running_loop()  # ### wichtig
 
                     async def handle_parsed(line: str):
-                        st = parse_line(line)
+                        nonlocal current
+                        st = parse_line(line, current)
                         if st:
+                            current = {"temperatureC": st["temperatureC"], "axes": dict(st["axes"])}
                             await put_worker.submit(st)
+                        else:
+                            print(f"[Parser] ignoriert: {line}")
 
                     def handle_notify(_handle, data: bytes):
                         for line in assembler.feed(data):
                             print(f"<< {line}")
-                            # fire-and-forget: in den Eventloop einplanen
-                            asyncio.get_event_loop().create_task(handle_parsed(line))
+                            # ### sicherer Task-Start
+                            loop.create_task(handle_parsed(line))
 
                     await client.start_notify(UART_TX_CHAR_UUID, handle_notify)
 
-                    # Optionale Konsole -> CPB (wie gehabt)
-                    tx_queue: asyncio.Queue[str] = asyncio.Queue()
-                    stdin_task = asyncio.create_task(stdin_to_queue(tx_queue))
+                    # Optional: Konsole -> CPB
+                    tx_q: asyncio.Queue[str] = asyncio.Queue()
+                    stdin_task = asyncio.create_task(stdin_to_queue(tx_q))
+                    print("Bereit. Beenden mit Ctrl+C")
 
-                    print("Bereit. Eingaben -> CPB. Beenden mit Ctrl+C")
+                    # ### (Optional) SIM-Test: alle 5s eine Beispiel-Zeile parsen
+                    # async def sim():
+                    #     while client.is_connected and not stop_event.is_set():
+                    #         await asyncio.sleep(5)
+                    #         await handle_parsed('temp=42.5 x=30 y=60 z=1.4')
+                    # loop.create_task(sim())
+
                     while client.is_connected and not stop_event.is_set():
                         try:
                             try:
-                                cmd = await asyncio.wait_for(tx_queue.get(), timeout=0.1)
+                                cmd = await asyncio.wait_for(tx_q.get(), timeout=0.2)
                                 if cmd:
-                                    payload = (cmd + "\n").encode("utf-8")
-                                    await client.write_gatt_char(UART_RX_CHAR_UUID, payload, response=False)
+                                    await client.write_gatt_char(UART_RX_CHAR_UUID, (cmd+"\n").encode("utf-8"), response=False)
                                     print(f">> {cmd}")
                             except asyncio.TimeoutError:
                                 pass
                         except BleakError as e:
-                            print("BLE-Fehler:", e)
-                            break
+                            print("BLE-Fehler:", e); break
                         except Exception as e:
-                            print("Fehler:", e)
-                            break
+                            print("Fehler:", e); break
 
-                    try:
-                        await client.stop_notify(UART_TX_CHAR_UUID)
-                    except Exception:
-                        pass
+                    try: await client.stop_notify(UART_TX_CHAR_UUID)
+                    except Exception: pass
                     stdin_task.cancel()
 
             except BleakError as e:
@@ -283,16 +244,12 @@ async def run():
                 print("Unerwarteter Fehler:", e)
 
             if not stop_event.is_set():
-                print("Getrennt. Neuer Verbindungsversuch in 3s...")
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    pass
+                print("Getrennt. Neuer Verbindungsversuch in 3s…")
+                try: await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+                except asyncio.TimeoutError: pass
 
         await put_worker.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(run())
+    except KeyboardInterrupt: pass
