@@ -57,51 +57,43 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path != "/telemetry":
             self._set_api_headers(404)
-            self.wfile.write(json.dumps({"error":"not found"}).encode("utf-8"))
+            self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length > 0 else b"{}"
             payload = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            self._set_headers(400, "application/json")
-            self.wfile.write(json.dumps({"error":"invalid json","detail":str(e)}).encode("utf-8"))
+            self._set_api_headers(400)
+            self.wfile.write(json.dumps({"error": "invalid json", "detail": str(e)}).encode("utf-8"))
             return
 
-        # Update STATE with validation/clamping
-        temp = payload.get("temperatureC", STATE["temperatureC"])
-        axes = payload.get("axes", STATE["axes"])
-        ts = payload.get("timestamp", now_iso())
-
-        try:
-            temp = float(temp)
-        except Exception:
-            temp = STATE["temperatureC"]
-
+        # Validierung/Clamping
         def clamp(v, lo, hi):
-            try:
-                v = float(v)
-            except Exception:
-                return None
+            try: v = float(v)
+            except: return None
             return max(lo, min(hi, v))
 
+        temp = clamp(payload.get("temperatureC", STATE["temperatureC"]), -20, 60)
+        axes = payload.get("axes", STATE["axes"])
         nx = clamp(axes.get("x", STATE["axes"]["x"]), -180, 180)
         ny = clamp(axes.get("y", STATE["axes"]["y"]), 0, 180)
         nz = clamp(axes.get("z", STATE["axes"]["z"]), 0.4, 5.0)
+        ts = payload.get("timestamp", now_iso())
 
-        if nx is None: nx = STATE["axes"]["x"]
-        if ny is None: ny = STATE["axes"]["y"]
-        if nz is None: nz = STATE["axes"]["z"]
-
-        STATE["temperatureC"] = temp
-        STATE["axes"] = {"x": nx, "y": ny, "z": nz}
+        STATE["temperatureC"] = STATE["temperatureC"] if temp is None else temp
+        STATE["axes"] = {
+            "x": STATE["axes"]["x"] if nx is None else nx,
+            "y": STATE["axes"]["y"] if ny is None else ny,
+            "z": STATE["axes"]["z"] if nz is None else nz,
+        }
         STATE["timestamp"] = ts
 
-        self._set_headers(200, "application/json", cores = True)
+        self._set_api_headers(200)
         self.wfile.write(json.dumps(STATE).encode("utf-8"))
 
 def run(host="localhost", port=8123):
-    print(f"Serving on http://{host}:{port} (GET/PUT /telemetry) and static files (index.html)")
+    print(f"Serving on http://{host}:{port}  (GET/PUT /telemetry) + static files")
     with HTTPServer((host, port), Handler) as httpd:
         try:
             httpd.serve_forever()
