@@ -1,27 +1,36 @@
-# Title: TA V – CPB Sensor Node + Cloud-LED-Steürung (BLE-UART Bridge)
+# Title: TA V – CPB Sensor Node + Cloud-LED-Steuerung (BLE-UART Bridge)
 # Author: Fabio Panteghini
-# Date: 2025-08-30
+# Date: 2025-09-13
 # -----------------------------------------------------------------
 #
 # Zweck:
-#  - Mind. 2 Umweltsensoren (hier: Licht, Temperatur, Bewegung) erfassen
-#  - Werte als Zeitreihe über BLE-UART an den Raspberry Pi senden
-#  - NeoPixel per Cloud -> Pi -> BLE-Textkommandos fernsteuern
+#  - Erfassung von mindestens 2 Umweltsensoren auf dem CPB:
+#      * Temperatur (NTC-Thermistor, A9)
+#      * Licht (ALS-PT19, A8)
+#      * Bewegung (LIS3DH Beschleunigungssensor, I2C)
+#  - Übertragung der Messwerte periodisch als Zeitreihe via BLE-UART an den Raspberry Pi
+#  - Raspberry Pi dient als Bridge zur IoT-Cloud (z. B. Adafruit IO)
+#  - Steuerung der NeoPixel (Farbe, Helligkeit, Reset etc.) erfolgt über Textkommandos
+#    vom Raspberry Pi / Cloud an das CPB
 #
 # Datenfluss:
-#  CPB (BLE UART Peripheral) <-> Raspberry Pi (BLE Central/Bridge) <-> IoT-Cloud (z. B. Adafruit IO)
+#  CPB (BLE UART Peripheral) <-> Raspberry Pi (BLE Central/Bridge) <-> IoT-Cloud
 #
-# Sendeformat (standard 1 Hz):
-#  SENS,seq=<n>,ms=<t>,light_raw=<int>,light_f=<float>,temp_C=<float>,ax_ms2=<f>,ay_ms2=<f>,az_ms2=<f>,ax_f=<f>,ay_f=<f>,az_f=<f>,batt_mV=<int>
+# Sendeformat (1 Hz):
+#  SENS,seq=<n>,ms=<t>,temp_C=<float>,light_raw=<int>,light_norm=<float>,
+#       ax_ms2=<f>,ay_ms2=<f>,az_ms2=<f>
 #
-# Empfangskommandos (Text, CSV):
-#  FILL,<r>,<g>,<b>
-#  PIX,<index>,<r>,<g>,<b>
-#  BRI,<0-100>
-#  RATE,<Hz>        (0.2 .. 5.0)
-#  SELFTEST?        (Prüft Sensoren und 1 Pixel)
-#  PING             (liefert OK,PING,ms=<now_ms>)
-#  INFO?            (einmalige Infozeile)
+# Empfangskommandos (UART-Text, CSV-basiert):
+#  - FILL r g b       → setzt alle NeoPixel auf eine RGB-Farbe (0–255)
+#  - FILLHEX RRGGBB   → setzt alle NeoPixel auf eine Hex-Farbe
+#  - BRIGHT <0–100>   → setzt Helligkeit in %
+#  - OFF              → schaltet alle NeoPixel aus
+#  - RESET            → Reset der NeoPixel auf Standard
+#  - GET / GET?       → gibt aktuellen Status (Farben, Helligkeit) zurück
+#  - TEMP? / GETTEMP? → einmalige Temperaturmessung senden
+#  - LIGHT?           → einmalige Lichtmessung senden
+#  - SENS? / GETSENS? → eine komplette Sensordatenzeile senden
+#  - TELEM <sek>      → setzt Periodendauer der Telemetrie (0 = aus)
 #
 # Abhängigkeiten (CircuitPython Bundle):
 #  - adafruit_ble
@@ -29,295 +38,365 @@
 #  - adafruit_thermistor
 #  - neopixel
 #
-# Board: Adafruit Circuit Playground Bluefruit
-# Python: CircuitPython
+# Board: Adafruit Circuit Playground Bluefruit (nRF52840, LIS3DH integriert)
+# Sprache: CircuitPython
+
+
 
 import time
 import board
 import neopixel
 import analogio
-import busio
-
-import adafruit_thermistor
-import adafruit_lis3dh
+from adafruit_thermistor import Thermistor
 
 from adafruit_ble import BLERadio
 from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
 from adafruit_ble.services.nordic import UARTService
 
-# ---------- Konfiguration ----------
+# Bewegungssensor: I2C + LIS3DH
+import busio
+from adafruit_lis3dh import LIS3DH_I2C, RANGE_2_G
+
+# === NeoPixel Setup ===
 NUM_PIXELS = 10
-DEFAULT_BRIGHTNESS = 0.2
-SENS_INTERVAL = 1.0  # s, Sendeintervall für Sensordaten (per RATE änderbar)
-MIN_HZ, MAX_HZ = 0.2, 5.0
+pixels = neopixel.NeoPixel(board.NEOPIXEL, NUM_PIXELS, brightness=0.06, auto_write=False)
 
-ACC_RANGE = adafruit_lis3dh.RANGE_2_G
+# === Sensoren ===
+# Temperatur: NTC am A9 (Alias TEMPERATURE, falls vorhanden)
+THERM_PIN = getattr(board, "TEMPERATURE", board.A9)
+thermistor = Thermistor(
+    pin=THERM_PIN,
+    series_resistor=10000.0,
+    nominal_resistance=10000.0,
+    nominal_temperature=25.0,
+    b_coefficient=3380.0
+)
 
-FW_VERSION = "1.1.0"
-BUILD_DATE = "2025-08-30"
-NODE_ID = "CPB-01"      # eindeutige ID
-INCLUDE_BATTERY = True  # falls nicht verfügbar -> wird -1 gesendet
+# Licht: ALS-PT19 an A8, liefert 0..65535 (heller = groesser)
+light = analogio.AnalogIn(board.A8)
 
-# Glättung (EMA) für schöne Kurven im Screencast
-ALPHA = 0.2
-
-# Rate-Limit für Kommandos
-MAX_CMDS_PER_SEC = 20
-
-# Heartbeat für Logs
-HEARTBEAT_SEC = 30.0
-
-# ---------- NeoPixel Setup ----------
-pixels = neopixel.NeoPixel(board.NEOPIXEL, NUM_PIXELS, brightness=DEFAULT_BRIGHTNESS, auto_write=False)
-pixels.fill((0, 0, 0))
-pixels.show()
-
-# ---------- Sensoren ----------
-light = analogio.AnalogIn(board.LIGHT)
-therm = adafruit_thermistor.Thermistor(board.TEMPERATURE, 10000, 10000, 25, 3950)
-
-i2c = busio.I2C(board.SCL, board.SDA)
-lis = adafruit_lis3dh.LIS3DH_I2C(i2c)  # 0x18 default
-lis.range = ACC_RANGE
-
-# Optionale Batteriespannung (Board Abhängig)
+# Bewegung: LIS3DH am internen I2C (nicht die Aussenpads!)
 try:
-    vbat = analogio.AnalogIn(board.VOLTAGE_MONITOR) if INCLUDE_BATTERY else None
-except Exception:
-    vbat = None
+    ACC_SCL = getattr(board, "ACCELEROMETER_SCL", board.SCL)
+    ACC_SDA = getattr(board, "ACCELEROMETER_SDA", board.SDA)
+    i2c = busio.I2C(ACC_SCL, ACC_SDA)
+except Exception as e:
+    print("I2C Init Fehler:", e)
+    i2c = None
 
-def read_battery_mV():
-    if not vbat:
-        return -1
-    try:
-        # CPB Bluefruit: analog -> 0..3.3 V, Spannungsteiler x2
-        return int((vbat.value * 3.3 / 65535.0) * 2 * 1000)
-    except Exception:
-        return -1
+lis3dh = None
+if i2c:
+    for addr in (0x19, 0x18):
+        try:
+            lis3dh = LIS3DH_I2C(i2c, address=addr)
+            lis3dh.range = RANGE_2_G
+            print("LIS3DH gefunden @ " + hex(addr))
+            break
+        except Exception as e:
+            print("LIS3DH nicht @ " + hex(addr) + " : " + str(e))
 
-# ---------- BLE UART ----------
+if lis3dh is None:
+    print("WARN: Kein LIS3DH gefunden – Bewegung wird 0.0 gemeldet")
+
+# Tiefpass fuer Beschleunigung
+ax_f = 0.0
+ay_f = 0.0
+az_f = 0.0
+alpha = 0.2  # 0..1; kleiner = staerker glaetten
+
+# === BLE Setup ===
 ble = BLERadio()
 uart = UARTService()
+adv = ProvideServicesAdvertisement(uart)
+adv.complete_name = "CPB_TA_V"
+ble.start_advertising(adv)
 
-advertisement = ProvideServicesAdvertisement(uart)
-advertisement.complete_name = "CPB_TA_V"   # <- eindeutiger Name für das Board
+# === State Machine ===
+STATE_WAIT, STATE_HANDLE, STATE_RESET, STATE_ERROR = range(4)
+state = STATE_WAIT
 
-# ---------- Optionaler Watchdog ----------
-try:
-    import microcontroller, watchdog
-    micro_wd = microcontroller.watchdog
-    micro_wd.timeout = 8.0
-    micro_wd.mode = watchdog.WatchDogMode.RESET
-except Exception:
-    micro_wd = None
+farben = [(40, 40, 40)] * NUM_PIXELS
+wait_t = time.monotonic()
+wait_on = False
+rx_buf = ""  # Zeilenpuffer fuer UART
 
-def wd_feed():
-    try:
-        if micro_wd:
-            micro_wd.feed()
-    except Exception:
-        pass
+# Telemetrie (Sekunden)
+telemetry_period = 1.0
+telemetry_t = time.monotonic()
 
-# ---------- Helfer ----------
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
+# === Helper ===
+def blinken_error(n=2, farbe=(50, 0, 0), dauer=0.15):
+    """Blinkt n-mal in der angegebenen Farbe."""
+    for _ in range(n):
+        pixels.fill(farbe)
+        pixels.show()
+        time.sleep(dauer)
+        pixels.fill((0, 0, 0))
+        pixels.show()
+        time.sleep(dauer)
 
-def parse_ints(parts, start_idx, count):
-    vals = []
-    for i in range(count):
-        vals.append(int(parts[start_idx + i]))
-    return vals
+def blink_wait():
+    """Blaues Blinken solange keine Verbindung besteht."""
+    global wait_t, wait_on
+    if time.monotonic() - wait_t > 0.5:
+        wait_t = time.monotonic()
+        wait_on = not wait_on
+        if wait_on:
+            pixels.fill((0, 0, 50))
+        else:
+            pixels.fill((0, 0, 0))
+        pixels.show()
 
-def send_line(text):
-    try:
-        uart.write((text + "\n").encode("utf-8"))
-    except Exception:
-        pass
+def aktualisiere():
+    """Alle LEDs entsprechend den gespeicherten Farben setzen."""
+    for i in range(NUM_PIXELS):
+        pixels[i] = farben[i]
+    pixels.show()
 
-def ok(tag, extra=""):
-    ts = "{:.0f}".format(time.monotonic()*1000.0)
-    send_line(f"OK,{tag},ms={ts}{(','+extra) if extra else ''}")
+def clamp8(x):
+    return max(0, min(255, int(x)))
 
-def err(tag, why=""):
-    ts = "{:.0f}".format(time.monotonic()*1000.0)
-    send_line(f"ERR,{tag},ms={ts}{(','+why) if why else ''}")
+def set_all(r, g, b):
+    """Alle LEDs auf eine RGB-Farbe setzen."""
+    rgb = (clamp8(r), clamp8(g), clamp8(b))
+    for i in range(NUM_PIXELS):
+        farben[i] = rgb
+    aktualisiere()
 
-def send_info():
-    # Einmalige Info sobald verbunden
-    send_line(f"INFO,CPB,TA-V,{FW_VERSION},{BUILD_DATE},NODE={NODE_ID},PIX=10,CMDS=FILL|PIX|BRI|RATE|INFO?|SELFTEST?|PING")
-
-def read_sensors():
-    # Liest die 3 Sensoren, gibt ein Tupel (lux_raw, temp_c, ax, ay, az) zurück
-    try:
-        ax, ay, az = lis.acceleration
-    except Exception:
-        ax, ay, az = 0.0, 0.0, 0.0
-    try:
-        temp_c = float(therm.temperature)
-    except Exception:
-        temp_c = 0.0
-    try:
-        lux_raw = int(light.value)
-    except Exception:
-        lux_raw = 0
-    return lux_raw, temp_c, ax, ay, az
-
-# ---- einfaches Rate-Limit für Befehle ----
-_last_cmd_times = []
-def allow_command():
-    global _last_cmd_times
-    now = time.monotonic()
-    _last_cmd_times = [t for t in _last_cmd_times if now - t < 1.0]
-    if len(_last_cmd_times) >= MAX_CMDS_PER_SEC:
+def set_all_hex(hexstr):
+    """Alle LEDs auf Hexfarbe RRGGBB setzen."""
+    hs = hexstr.strip().lstrip("#")
+    if len(hs) != 6:
         return False
-    _last_cmd_times.append(now)
+    r = int(hs[0:2], 16)
+    g = int(hs[2:4], 16)
+    b = int(hs[4:6], 16)
+    set_all(r, g, b)
     return True
 
-# ---------- Command Handler ----------
+def reset_all():
+    """Standardzustand fuer Start oder Reset."""
+    for i in range(NUM_PIXELS):
+        farben[i] = (40, 40, 40)
+    pixels.brightness = 0.06
+    pixels.fill((0, 0, 80))
+    pixels.show()
+    time.sleep(0.2)
+    pixels.fill((0, 0, 0))
+    pixels.show()
+    aktualisiere()
+
+def ok(msg):
+    try:
+        uart.write(("OK " + msg + "\n").encode("utf-8"))
+    except Exception as e:
+        print("UART write err:", e)
+
+def err(msg):
+    try:
+        uart.write(("ERR " + msg + "\n").encode("utf-8"))
+    except Exception as e:
+        print("UART write err:", e)
+
+def send_status():
+    try:
+        parts = []
+        for i, (r, g, b) in enumerate(farben):
+            parts.append("{}:{},{},{}".format(i, r, g, b))
+        cols = ";".join(parts)
+        uart.write(("STAT bright={} colors={}\n".format(int(pixels.brightness*100), cols)).encode("utf-8"))
+    except Exception as e:
+        print("UART write err:", e)
+
+def ms():
+    """Millisekunden seit Start."""
+    return time.monotonic_ns() // 1_000_000
+
+# === Sensors: Readouts ===
+def read_temp_c():
+    """Temperatur in °C lesen."""
+    try:
+        return float(thermistor.temperature)
+    except Exception as e:
+        print("ERR temp:", e)
+        return float("nan")
+
+def read_light():
+    """Lichtwert lesen: raw 0..65535 sowie normiert 0..1.0."""
+    try:
+        raw = int(light.value)
+        norm = raw / 65535.0
+        return raw, norm
+    except Exception as e:
+        print("ERR light:", e)
+        return -1, 0.0
+
+def read_acc_ms2():
+    """Beschleunigung in m/s^2 lesen (0,0,0 wenn Sensor fehlt)."""
+    if lis3dh is None:
+        return 0.0, 0.0, 0.0
+    try:
+        ax, ay, az = lis3dh.acceleration  # m/s^2
+        return float(ax), float(ay), float(az)
+    except Exception as e:
+        print("ERR acc:", e)
+        return 0.0, 0.0, 0.0
+
+# === Telemetrie-Zeile senden ===
+def send_sens_line():
+    """SENS-Zeile mit Zeit, Temperatur, Licht und Bewegung senden."""
+    global ax_f, ay_f, az_f
+    t_c = read_temp_c()
+    l_raw, l_norm = read_light()
+    ax, ay, az = read_acc_ms2()
+
+    # Tiefpass anwenden
+    ax_f = (1 - alpha) * ax_f + alpha * ax
+    ay_f = (1 - alpha) * ay_f + alpha * ay
+    az_f = (1 - alpha) * az_f + alpha * az
+
+    line = "SENS"
+    line += ",ms={}".format(ms())
+    line += ",temp_C={:.2f}".format(t_c)
+    line += ",light_raw={},light_norm={:.4f}".format(l_raw, l_norm)
+    line += ",ax_ms2={:.3f},ay_ms2={:.3f},az_ms2={:.3f}".format(ax, ay, az)
+    line += ",ax_f={:.3f},ay_f={:.3f},az_f={:.3f}\n".format(ax_f, ay_f, az_f)
+    line += "\n"
+    try:
+        uart.write(line.encode("utf-8"))
+    except Exception as e:
+        print("UART write err:", e)
+
+# === Kommando-Parser ===
 def handle_command(line: str):
-    # Verarbeitet Kommandos, die vom Raspberry Pi (aus der IoT-Cloud) über BLE kommen.
-    line = line.strip()
+    """Parser fuer UART-Kommandos vom Pi/Cloud."""
+    global telemetry_period
     if not line:
         return
-    if not allow_command():
-        err("RATE")
+    parts = line.strip().split()
+    if not parts:
         return
-
-    parts = line.split(",")
     cmd = parts[0].upper()
 
-    if cmd == "FILL" and len(parts) == 4:
-        try:
-            r, g, b = parse_ints(parts, 1, 3)
-            r = clamp(r, 0, 255); g = clamp(g, 0, 255); b = clamp(b, 0, 255)
-            pixels.fill((r, g, b)); pixels.show()
-            ok("FILL")
-        except Exception as e:
-            err("FILL", str(e))
+    try:
+        if cmd == "FILL" and len(parts) == 4:
+            r, g, b = map(int, parts[1:4])
+            set_all(r, g, b)
+            ok("FILL {} {} {}".format(r, g, b))
 
-    elif cmd == "PIX" and len(parts) == 5:
-        try:
-            idx, r, g, b = parse_ints(parts, 1, 4)
-            if 0 <= idx < NUM_PIXELS:
-                r = clamp(r, 0, 255); g = clamp(g, 0, 255); b = clamp(b, 0, 255)
-                pixels[idx] = (r, g, b); pixels.show()
-                ok("PIX")
+        elif cmd == "FILLHEX" and len(parts) == 2:
+            if set_all_hex(parts[1]):
+                ok("FILLHEX " + parts[1])
             else:
-                err("PIX", "idx")
-        except Exception as e:
-            err("PIX", str(e))
+                err("hex")
 
-    elif cmd == "BRI" and len(parts) == 2:
-        try:
-            val = clamp(int(parts[1]), 0, 100)
-            pixels.brightness = val / 100.0
-            pixels.show()
-            ok("BRI")
-        except Exception as e:
-            err("BRI", str(e))
+        elif cmd == "BRIGHT" and len(parts) == 2:
+            pct = max(0, min(100, int(parts[1])))
+            pixels.brightness = pct / 100.0
+            aktualisiere()
+            ok("BRIGHT {}".format(pct))
 
-    elif cmd == "RATE" and len(parts) == 2:
-        try:
-            hz = float(parts[1])
-            if hz < MIN_HZ or hz > MAX_HZ:
-                err("RATE", "range")
-            else:
-                global SENS_INTERVAL
-                SENS_INTERVAL = 1.0 / hz
-                ok("RATE", f"Hz={hz:.2f}")
-        except Exception as e:
-            err("RATE", str(e))
+        elif cmd == "OFF":
+            set_all(0, 0, 0)
+            ok("OFF")
 
-    elif cmd in ("SELFTEST","SELFTEST?"):
-        ok_sensors = True
-        try:
-            _ = read_sensors()
-        except Exception:
-            ok_sensors = False
-        try:
-            pixels[0] = (10,0,0); pixels.show()
-            pixels[0] = (0,0,0); pixels.show()
-            ok_led = True
-        except Exception:
-            ok_led = False
-        status = "OK" if (ok_sensors and ok_led) else "ERR"
-        send_line(f"SELFTEST,{status},sensors={ok_sensors},led={ok_led}")
+        elif cmd == "RESET":
+            reset_all()
+            ok("RESET")
 
-    elif cmd in ("INFO", "INFO?"):
-        send_info()
+        elif cmd in ("GET?", "GET"):
+            send_status()
 
-    elif cmd == "PING":
-        ok("PING")
-
-    else:
-        # Unbekanntes Kommando
-        err("CMD")
-
-# ---------- Main ----------
-buffer = b""
-last_sens = 0.0
-_last_hb = 0.0
-seq = 0
-
-# EMA-Zustände
-_f_light = None
-_f_ax = _f_ay = _f_az = None
-
-while True:
-    # 1. Werbung senden, solange kein Gerät verbunden ist
-    ble.start_advertising(advertisement)
-    while not ble.connected:
-        wd_feed()
-        time.sleep(0.05)
-    ble.stop_advertising()
-
-    # 2. Sobald verbunden, einmalige Info senden
-    send_info()
-    last_sens = 0.0
-    _last_hb = 0.0
-
-    while ble.connected:
-        wd_feed()
-        # 3. Eingehende Nachrichten zeilenweise lesen und auswerten
-        if uart.in_waiting:
+        elif cmd in ("GETTEMP?", "TEMP?"):
+            t_c = read_temp_c()
             try:
-                data = uart.read(uart.in_waiting)
-                if data:
-                    buffer += data
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        try:
-                            text = line.decode("utf-8").strip()
-                        except UnicodeError:
-                            continue
-                        handle_command(text)
-            except Exception:
-                # Robust weiterlaufen
-                pass
+                uart.write(("TEMP C={:.2f}\n".format(t_c)).encode("utf-8"))
+            except Exception as e:
+                print("UART write err:", e)
 
-        # 4. Alle SENS_INTERVAL Sekunden aktuelle Sensorwerte senden
-        now = time.monotonic()
-        if now - last_sens >= SENS_INTERVAL:
-            last_sens = now
-            lux_raw, temp_c, ax, ay, az = read_sensors()
+        elif cmd in ("GETLIGHT?", "LIGHT?"):
+            l_raw, l_norm = read_light()
+            try:
+                uart.write(("LIGHT raw={} norm={:.4f}\n".format(l_raw, l_norm)).encode("utf-8"))
+            except Exception as e:
+                print("UART write err:", e)
 
-            # Glättung
-            def ema(prev, new, a=ALPHA):
-                return new if prev is None else (a*new + (1-a)*prev)
-            _f_light = ema(_f_light, float(lux_raw))
-            _f_ax = ema(_f_ax, ax); _f_ay = ema(_f_ay, ay); _f_az = ema(_f_az, az)
+        elif cmd in ("GETACC?", "ACC?"):
+            ax, ay, az = read_acc_ms2()
+            try:
+                uart.write(("ACC ax={:.3f} ay={:.3f} az={:.3f}\n".format(ax, ay, az)).encode("utf-8"))
+            except Exception as e:
+                print("UART write err:", e)
 
-            seq += 1
-            batt_mV = read_battery_mV()
-            msg = "SENS,seq={:d},ms={:.0f},light_raw={},light_f={:.1f},temp_C={:.2f},ax_ms2={:.3f},ay_ms2={:.3f},az_ms2={:.3f},ax_f={:.3f},ay_f={:.3f},az_f={:.3f},batt_mV={:d}".format(
-                seq, now * 1000.0, lux_raw, _f_light if _f_light is not None else float(lux_raw), temp_c,
-                ax, ay, az, _f_ax if _f_ax is not None else ax, _f_ay if _f_ay is not None else ay, _f_az if _f_az is not None else az, batt_mV
-            )
-            send_line(msg)
+        elif cmd in ("GETSENS?", "SENS?"):
+            send_sens_line()
 
-        # 5. Heartbeat für Logs
-        if now - _last_hb >= HEARTBEAT_SEC:
-            _last_hb = now
-            send_line(f"HB,ms={now*1000:.0f},node={NODE_ID},ver={FW_VERSION}")
+        elif cmd == "TELEM" and len(parts) == 2:
+            val_raw = parts[1].upper()
+            if val_raw == "OFF":
+                telemetry_period = 0.0
+                ok("TELEM OFF")
+            else:
+                val = float(parts[1])
+                if val < 0.0:
+                    val = 0.0
+                telemetry_period = val
+                ok("TELEM {}".format(val))
 
-        time.sleep(0.01)
+        else:
+            err("unknown")
+
+    except Exception as e:
+        print("Cmd error:", e)
+        err("format")
+
+# === Main Loop ===
+while True:
+    try:
+        if state == STATE_WAIT:
+            blink_wait()
+            if ble.connected:
+                pixels.fill((0, 50, 0))
+                pixels.show()
+                time.sleep(0.2)
+                pixels.fill((0, 0, 0))
+                pixels.show()
+                reset_all()
+                rx_buf = ""
+                telemetry_t = time.monotonic()
+                state = STATE_HANDLE
+
+        elif state == STATE_HANDLE:
+            # UART-Kommandos lesen (Zeilen)
+            if uart.in_waiting:
+                raw = uart.read(uart.in_waiting)
+                if raw:
+                    rx_buf += raw.decode("utf-8", errors="ignore")
+                    while "\n" in rx_buf:
+                        line, rx_buf = rx_buf.split("\n", 1)
+                        handle_command(line.strip())
+
+            # Telemetrie senden
+            if telemetry_period > 0.0:
+                now = time.monotonic()
+                if now - telemetry_t >= telemetry_period:
+                    telemetry_t = now
+                    send_sens_line()
+
+            # Disconnect-Handling
+            if not ble.connected:
+                ble.start_advertising(adv)
+                state = STATE_WAIT
+
+        elif state == STATE_RESET:
+            reset_all()
+            state = STATE_HANDLE
+
+        elif state == STATE_ERROR:
+            blinken_error()
+            state = STATE_HANDLE
+
+    except Exception as e:
+        print("Fehler:", e)
+        blinken_error()
+        state = STATE_HANDLE
