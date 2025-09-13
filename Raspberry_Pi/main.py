@@ -28,24 +28,85 @@ API_TELEMETRY = f"{API_BASE}/telemetry"
 # Erfasst temp / t / temperatureC sowie x/y/z, egal ob ":" oder "=" oder Leerzeichen.
 _TOKEN_RE = re.compile(r"(temperaturec|temperature|temp|t|x|y|z)\s*[:=\s]\s*([-+]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def _finalize_state(t: float, x: float, y: float, z: float, ts: str) -> Dict[str, Any]:
+    return {
+        "temperatureC": float(t),
+        "axes": {"x": float(x), "y": float(y), "z": float(z)},
+        "timestamp": ts,
+    }
+
+_TOKEN_RE = re.compile(r"(?:\b|_)\s*(t(?:emp(?:eraturec?)?)?|x|y|z)\s*[:=]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))", re.I)
+
+def _parse_kv_csv(line: str) -> Dict[str, str]:
+    """
+    Parst eine 'key=value'-Liste (CSV), z. B.:
+      SENS,seq=123,ms=456,temp_C=27.1,ax_ms2=0.1,ay_ms2=0.2,az_ms2=9.5,ax_f=...
+    Gibt dict mit lowercase-keys zurück.
+    """
+    parts = line.split(",")
+    # ersten Token wie 'SENS' ignorieren
+    if parts and "=" not in parts[0]:
+        parts = parts[1:]
+    out: Dict[str, str] = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+def _to_float_or_none(v: Optional[str]) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
 
 def parse_line(line: str, last: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Akzeptiert:
       - JSON: {"temperatureC":..,"axes":{"x":..,"y":..,"z":..}} oder {"temp":..,"x":..,"y":..,"z":..}
-      - Tokens: 'T=37.2 X=10 Y=75 Z=1.8' oder 'temp:37.2 x:10 y:75 z:1.8' oder 't 37.2 x 10 y 75 z 1.8'
-    Fehlende Werte werden mit 'last' aufgefüllt (Partial-Updates erlaubt).
+      - Tokens: 'T=37.2 X=10 Y=75 Z=1.8' bzw. 'temp:37.2 x:10 y:75 z:1.8'
+      - CPB SENS-CSV: 'SENS,seq=...,ms=...,temp_C=...,ax_ms2=...,ay_ms2=...,az_ms2=...,ax_f=...,ay_f=...,az_f=...'
+    Fehlende Werte werden mit 'last' aufgefüllt.
     """
     line = (line or "").strip()
     if not line:
         return None
 
-    # 1) JSON
+    # --- 1) CPB SENS-CSV ---
+    if line.startswith("SENS"):
+        kv = _parse_kv_csv(line)
+        # Temperatur
+        t = (
+            _to_float_or_none(kv.get("temp_c"))
+            or _to_float_or_none(kv.get("temperaturec"))
+            or _to_float_or_none(kv.get("temp"))
+            or _to_float_or_none(kv.get("t"))
+        )
+        # Bevorzugt gefilterte Achsen, sonst Rohwerte
+        ax = _to_float_or_none(kv.get("ax_f")) or _to_float_or_none(kv.get("ax_ms2")) or _to_float_or_none(kv.get("ax"))
+        ay = _to_float_or_none(kv.get("ay_f")) or _to_float_or_none(kv.get("ay_ms2")) or _to_float_or_none(kv.get("ay"))
+        az = _to_float_or_none(kv.get("az_f")) or _to_float_or_none(kv.get("az_ms2")) or _to_float_or_none(kv.get("az"))
+
+        # Timestamp: 'ms' ist monotonic und kein Unix-Epoch → nimm aktuelle Zeit als ISO
+        ts = _now_iso()
+
+        # Partials auffüllen
+        t = t if t is not None else last["temperatureC"]
+        ax = ax if ax is not None else last["axes"]["x"]
+        ay = ay if ay is not None else last["axes"]["y"]
+        az = az if az is not None else last["axes"]["z"]
+
+        return _finalize_state(t, ax, ay, az, ts)
+
+    # --- 2) JSON ---
     if line.startswith("{") and line.endswith("}"):
         try:
             raw = json.loads(line)
@@ -64,7 +125,7 @@ def parse_line(line: str, last: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # 2) Tokens
+    # 3) Tokens
     tokens = dict((k.lower(), float(v)) for k, v in _TOKEN_RE.findall(line))
     if tokens:
         t = tokens.get("temperaturec") or tokens.get("temperature") or tokens.get("temp") or tokens.get("t")
