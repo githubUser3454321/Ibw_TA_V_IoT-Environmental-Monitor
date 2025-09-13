@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telemetry Demo – Model + Background + Charts</title>
+  <link rel="stylesheet" href="styles.css">
+  <!-- model-viewer -->
+  <script type="module" src="https://unpkg.com/@google/model-viewer@3.4.0/dist/model-viewer.min.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Telemetry Demo</h1>
+    <p class="tag">API: GET/PUT <code>/telemetry</code> – Demo-Modell (Astronaut)</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <model-viewer id="mv" class="viewer"
+        src="https://modelviewer.dev/shared-assets/models/Astronaut.glb"
+        environment-image="https://modelviewer.dev/shared-assets/environments/spruit_sunrise_1k_HDR.hdr"
+        shadow-intensity="1" exposure="1.0"
+        alt="Demo 3D Modell (Astronaut)">
+      </model-viewer>
+      <div id="status" class="status">–</div>
+    </section>
+
+    <section class="card">
+      <h2>Live Daten</h2>
+      <div class="kv">
+        <div><span class="k">Temperatur</span><span class="v"><span id="tVal">–</span> °C</span></div>
+        <div><span class="k">X (Yaw)</span><span class="v"><span id="xVal">–</span> °</span></div>
+        <div><span class="k">Y (Pitch)</span><span class="v"><span id="yVal">–</span> °</span></div>
+        <div><span class="k">Z (Radius)</span><span class="v"><span id="zVal">–</span> m</span></div>
+        <div><span class="k">Timestamp</span><span class="v"><span id="tsVal">–</span></span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Temperaturverlauf</h2>
+      <canvas id="tempChart" height="180"></canvas>
+    </section>
+
+    <section class="card">
+      <h2>Achsenverlauf (X/Y/Z)</h2>
+      <canvas id="axesChart" height="220"></canvas>
+    </section>
+  </main>
+
+  <footer>
+    © 2025 – Demo. Server: <code>python3 server.py</code> → <a href="http://localhost:8123" target="_blank">http://localhost:8123</a>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

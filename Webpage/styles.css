@@ -1,0 +1,21 @@
+/* Basic layout + dynamic background via CSS variable --bgHue */
+:root { --bgHue: 220; --bgSat: 45%; --bgLight1: 10%; --bgLight2: 16%; --panel:#121a33; --text:#e9ecf1; --muted:#9aa3b2; }
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto;
+  color:var(--text);
+  background: linear-gradient(180deg, hsl(var(--bgHue), var(--bgSat), var(--bgLight1)), hsl(calc(var(--bgHue) - 10), var(--bgSat), var(--bgLight2)));
+  transition: background 300ms ease;
+}
+header{padding:20px 16px;border-bottom:1px solid #243056;background:rgba(0,0,0,.25);backdrop-filter:blur(6px);position:sticky;top:0}
+h1{margin:0;font-size:20px}
+.tag{color:var(--muted);font-size:12px}
+main{max-width:1000px;margin:20px auto;padding:0 16px;display:grid;gap:16px}
+.card{background:var(--panel);border:1px solid #243056;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.25);overflow:hidden}
+.viewer{display:block;width:100%;height:420px;border-bottom:1px solid #243056}
+.status{padding:10px 14px;color:var(--muted);font-size:12px}
+.kv{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;padding:12px 14px}
+.k{color:var(--muted);margin-right:8px}
+.v{font-weight:700}
+footer{max-width:1000px;margin:10px auto 30px;color:var(--muted);padding:0 16px;font-size:12px}
