@@ -2,6 +2,5 @@
 # Diese requirements.txt dient nur der Dokumentation bzw. fuer lokale Tools/Type-Checker.
 
 adafruit-circuitpython-ble
-adafruit-circuitpython-lis3dh
 adafruit-circuitpython-thermistor
 adafruit-circuitpython-neopixel
