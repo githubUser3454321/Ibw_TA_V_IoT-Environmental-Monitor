@@ -69,92 +69,53 @@ def _g_norm(ax: float, ay: float, az: float) -> float:
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
-def _finalize_state(t, x, y, z, ts):
+def _finalize_state(t, light_raw, light_norm, ts):
     t = _clamp(float(t), -20.0, 60.0)
-    x = _clamp(float(x), -180.0, 180.0)
-    y = _clamp(float(y), 0.0, 180.0)
-    z = _clamp(float(z), 0.4, 5.0)
-    return {"temperatureC": t, "axes": {"x": x, "y": y, "z": z}, "timestamp": ts}
+    light_raw = max(0, int(light_raw))
+    light_norm = _clamp(float(light_norm), 0.0, 1.0)
+    return {"temperatureC": t, "light": {"raw": light_raw, "norm": light_norm}, "timestamp": ts}
+
 
 # ---- parse_line: CPB SENS, JSON, Tokens ----
 def parse_line(line: str, last: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     line = (line or "").strip()
     if not line:
         return None
+    ts = _now_iso()
 
-    # 1) CPB SENS-CSV
+    # 1) CPB SENS-CSV (neu)
     if line.startswith("SENS"):
         kv = _parse_kv_csv(line)
         t  = (_to_float_or_none(kv.get("temp_c"))
               or _to_float_or_none(kv.get("temperaturec"))
               or _to_float_or_none(kv.get("temp"))
               or _to_float_or_none(kv.get("t")))
-        ax = (_to_float_or_none(kv.get("ax_f"))
-              or _to_float_or_none(kv.get("ax_ms2"))
-              or _to_float_or_none(kv.get("ax")))
-        ay = (_to_float_or_none(kv.get("ay_f"))
-              or _to_float_or_none(kv.get("ay_ms2"))
-              or _to_float_or_none(kv.get("ay")))
-        az = (_to_float_or_none(kv.get("az_f"))
-              or _to_float_or_none(kv.get("az_ms2"))
-              or _to_float_or_none(kv.get("az")))
-        ts = _now_iso()
+        lr = _to_float_or_none(kv.get("light_raw"))
+        ln = _to_float_or_none(kv.get("light_norm"))
 
-        # Partials auffüllen
-        t  = t  if t  is not None else last["temperatureC"]
-        ax = ax if ax is not None else last["axes"]["x"]
-        ay = ay if ay is not None else last["axes"]["y"]
-        az = az if az is not None else last["axes"]["z"]
+        # Partials: aus letztem State auffüllen
+        t  = t  if t  is not None else last.get("temperatureC", 20.0)
+        lr = lr if lr is not None else ((last.get("light") or {}).get("raw", 0))
+        ln = ln if ln is not None else ((last.get("light") or {}).get("norm", 0.0))
 
-        # Orientierung relativ zur Baseline
-        pitch_deg = _pitch_from_acc(ax, ay, az)
-        yaw_rel   = 0.0 - YAW0_DEG              # ohne Magnetometer bleibt yaw ~ 0
-        pitch_rel = abs(pitch_deg - PITCH0_DEG) # Abweichung in Grad (0..180)
-        gmag      = _g_norm(ax, ay, az)         # z: Gesamtbeschl. in g
-
-        return _finalize_state(t, yaw_rel, pitch_rel, gmag, ts)
-
-    # 2) JSON
+        return _finalize_state(t, lr, ln, ts)
     if line.startswith("{") and line.endswith("}"):
         try:
             raw = json.loads(line)
             t  = raw.get("temperatureC") or raw.get("temp") or raw.get("t")
-            ax = (raw.get("axes") or {}).get("x", raw.get("x"))
-            ay = (raw.get("axes") or {}).get("y", raw.get("y"))
-            az = (raw.get("axes") or {}).get("z", raw.get("z"))
-            ts = raw.get("timestamp") or _now_iso()
+            light = raw.get("light") or {}
+            lr = light.get("raw", raw.get("light_raw"))
+            ln = light.get("norm", raw.get("light_norm"))
 
-            t  = float(t)  if t  is not None else last["temperatureC"]
-            ax = float(ax) if ax is not None else last["axes"]["x"]
-            ay = float(ay) if ay is not None else last["axes"]["y"]
-            az = float(az) if az is not None else last["axes"]["z"]
+            t  = float(t)  if t  is not None else last.get("temperatureC", 20.0)
+            lr = float(lr) if lr is not None else ((last.get("light") or {}).get("raw", 0))
+            ln = float(ln) if ln is not None else ((last.get("light") or {}).get("norm", 0.0))
 
-            pitch_deg = _pitch_from_acc(ax, ay, az)
-            yaw_rel   = 0.0 - YAW0_DEG
-            pitch_rel = abs(pitch_deg - PITCH0_DEG)
-            gmag      = _g_norm(ax, ay, az)
-
-            return _finalize_state(t, yaw_rel, pitch_rel, gmag, ts)
+            return _finalize_state(t, lr, ln, raw.get("timestamp") or ts)
         except Exception:
             pass
 
-    # 3) Tokens
-    tokens = dict((k.lower(), float(v)) for k, v in _TOKEN_RE.findall(line))
-    if tokens:
-        t  = tokens.get("temperaturec") or tokens.get("temperature") or tokens.get("temp") or tokens.get("t")
-        ax = tokens.get("x"); ay = tokens.get("y"); az = tokens.get("z")
-        t  = t  if t  is not None else last["temperatureC"]
-        ax = ax if ax is not None else last["axes"]["x"]
-        ay = ay if ay is not None else last["axes"]["y"]
-        az = az if az is not None else last["axes"]["z"]
-
-        pitch_deg = _pitch_from_acc(ax, ay, az)
-        yaw_rel   = 0.0 - YAW0_DEG
-        pitch_rel = abs(pitch_deg - PITCH0_DEG)
-        gmag      = _g_norm(ax, ay, az)
-
-        return _finalize_state(t, yaw_rel, pitch_rel, gmag, _now_iso())
-
+    # 3) Sonst ignorieren
     return None
 
 # ---- BLE: Zeilenassembler & Loop ----
@@ -237,7 +198,7 @@ async def run():
         put_worker = PutWorker(http, API_TELEMETRY, max_rate_hz=10.0)
 
         # RAM-State
-        current = {"temperatureC": 20.0, "axes": {"x": 0.0, "y": 0.0, "z": 9.81}}
+        current = {"temperatureC": 20.0, "light": {"raw": 0, "norm": 0.0}}
 
         while not stop_event.is_set():
             try:
@@ -268,7 +229,7 @@ async def run():
                             if line.strip():
                                 print(f"[Parser] ignoriert: {line}")
                             return
-                        current = {"temperatureC": st["temperatureC"], "axes": dict(st["axes"])}
+                        current = {"temperatureC": st["temperatureC"], "light": dict(st["light"])}
                         print(st)
                         await put_worker.submit(st)
 

@@ -4,14 +4,29 @@ from http.server import SimpleHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
-STATE = {
-    "temperatureC": 20.0,
-    "axes": {"x": 0.0, "y": 75.0, "z": 2.0},
-    "timestamp": datetime.now(timezone.utc).isoformat()
-}
-
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+# --- Neues STATE-Schema: Temperatur + Licht ---
+STATE = {
+    "temperatureC": 20.0,
+    "light": {"raw": 0, "norm": 0.0},
+    "timestamp": now_iso()
+}
+
+def _clamp_float(v, lo, hi):
+    try:
+        v = float(v)
+    except Exception:
+        return None
+    return max(lo, min(hi, v))
+
+def _clamp_int_ge0(v):
+    try:
+        v = int(v)
+    except Exception:
+        return None
+    return max(0, v)
 
 class Handler(SimpleHTTPRequestHandler):
     # zentrale Helfer
@@ -25,7 +40,6 @@ class Handler(SimpleHTTPRequestHandler):
 
     # >>> CORS auch für statische Module erlauben <<<
     def end_headers(self):
-        # Für Module/Assets CORS erlauben (wenn von anderem Origin geladen)
         if self.path.endswith((".js", ".mjs", ".css", ".glb", ".gltf", ".hdr")):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
@@ -37,7 +51,6 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/telemetry":
             self._set_api_headers(204)
         else:
-            # Statische Preflight-Anfragen (falls Browser welche schickt)
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
@@ -50,7 +63,6 @@ class Handler(SimpleHTTPRequestHandler):
             self._set_api_headers(200)
             self.wfile.write(json.dumps(STATE).encode("utf-8"))
         else:
-            # Statisch ausliefern (CORS-Header kommen in end_headers())
             return super().do_GET()
 
     def do_PUT(self):
@@ -59,6 +71,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._set_api_headers(404)
             self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
             return
+
         try:
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -68,25 +81,29 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid json", "detail": str(e)}).encode("utf-8"))
             return
 
-        # Validierung/Clamping
-        def clamp(v, lo, hi):
-            try: v = float(v)
-            except: return None
-            return max(lo, min(hi, v))
+        # --- Temperatur clampen ---
+        temp = _clamp_float(payload.get("temperatureC", STATE["temperatureC"]), -20, 60)
 
-        temp = clamp(payload.get("temperatureC", STATE["temperatureC"]), -20, 60)
-        axes = payload.get("axes", STATE["axes"])
-        nx = clamp(axes.get("x", STATE["axes"]["x"]), -180, 180)
-        ny = clamp(axes.get("y", STATE["axes"]["y"]), 0, 180)
-        nz = clamp(axes.get("z", STATE["axes"]["z"]), 0.4, 5.0)
+        # --- Licht lesen (neu) ---
+        light = payload.get("light", None)
+        lr = ln = None
+        if isinstance(light, dict):
+            lr = _clamp_int_ge0(light.get("raw"))
+            ln = _clamp_float(light.get("norm"), 0.0, 1.0)
+
+        # --- Sanfte Migration: falls alte Sender 'axes' schicken, tolerieren ---
+        # (Optional: hier könnte man aus 'axes.z' eine Pseudo-Helligkeit ableiten.
+        # Wir ignorieren 'axes' standardmäßig, brechen aber nicht ab.)
+        # axes = payload.get("axes")
+
         ts = payload.get("timestamp", now_iso())
 
-        STATE["temperatureC"] = STATE["temperatureC"] if temp is None else temp
-        STATE["axes"] = {
-            "x": STATE["axes"]["x"] if nx is None else nx,
-            "y": STATE["axes"]["y"] if ny is None else ny,
-            "z": STATE["axes"]["z"] if nz is None else nz,
-        }
+        # --- STATE aktualisieren (nur wenn Werte valide sind) ---
+        if temp is not None:
+            STATE["temperatureC"] = temp
+        if lr is not None or ln is not None:
+            STATE["light"]["raw"]  = STATE["light"]["raw"]  if lr is None else lr
+            STATE["light"]["norm"] = STATE["light"]["norm"] if ln is None else ln
         STATE["timestamp"] = ts
 
         self._set_api_headers(200)
