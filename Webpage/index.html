@@ -30,6 +30,27 @@
     </section>
 
     <section class="card">
+        <h2>LED Steuerung</h2>
+        <div class="kv">
+            <div><span class="k">Status</span><span class="v"><span id="ledState">–</span></span></div>
+        </div>
+
+        <div class="controls">
+            <button id="btnOn">LED AN</button>
+            <button id="btnOff">LED AUS</button>
+            <label>
+                Farbe:
+                <input id="ledColor" type="color" value="#ffa000">
+            </label>
+            <label>
+                Helligkeit: <span id="briVal">20</span>%
+                <input id="ledBri" type="range" min="0" max="100" value="20">
+            </label>
+        </div>
+    </section>
+
+
+    <section class="card">
         <h2>Temperaturverlauf</h2>
         <canvas id="tempChart" height="180"></canvas>
     </section>

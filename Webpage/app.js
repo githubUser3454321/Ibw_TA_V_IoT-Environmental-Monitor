@@ -7,6 +7,8 @@ const lightNormVal = document.getElementById('lightNormVal');
 const tsVal = document.getElementById('tsVal');
 
 const API_URL = `${window.location.origin}/telemetry`;
+const LED_URL = `${window.location.origin}/led`;
+
 
 function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
 
@@ -113,6 +115,90 @@ async function poll() {
         setStatus('API nicht erreichbar…');
     }
 }
+
+function rgbFromHex(hex) {
+    const h = hex.replace('#', '');
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+function hexFromRgb([r, g, b]) {
+    const to2 = (n) => n.toString(16).padStart(2, '0');
+    return `#${to2(r)}${to2(g)}${to2(b)}`;
+}
+
+async function ledGet() {
+    const res = await fetch(LED_URL, { method: 'GET' });
+    if (!res.ok) throw new Error(`LED GET HTTP ${res.status}`);
+    return await res.json(); // { on, rgb:[r,g,b], brightness, updatedAt }
+}
+
+async function ledPut({ on, rgb, brightness }) {
+    const body = {};
+    if (typeof on === 'boolean') body.on = on;
+    if (Array.isArray(rgb)) body.rgb = rgb;
+    if (typeof brightness === 'number') body.brightness = brightness;
+
+    const res = await fetch(LED_URL, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(`LED PUT HTTP ${res.status}`);
+    return await res.json();
+}
+
+// === LED UI Wiring ===
+const ledStateEl = document.getElementById('ledState');
+const btnOn = document.getElementById('btnOn');
+const btnOff = document.getElementById('btnOff');
+const colorInp = document.getElementById('ledColor');
+const briInp = document.getElementById('ledBri');
+const briVal = document.getElementById('briVal');
+
+function setLedStatusText(led) {
+    if (!ledStateEl) return;
+    const hex = hexFromRgb(led.rgb || [0, 0, 0]);
+    ledStateEl.textContent = led.on ? `AN (${hex}, ${led.brightness}%)` : 'AUS';
+}
+
+async function refreshLedUI() {
+    try {
+        const led = await ledGet();
+        if (colorInp) colorInp.value = hexFromRgb(led.rgb || [255, 160, 0]);
+        if (briInp) { briInp.value = led.brightness ?? 20; briVal.textContent = String(briInp.value); }
+        setLedStatusText(led);
+    } catch (e) {
+        if (ledStateEl) ledStateEl.textContent = 'API nicht erreichbar…';
+    }
+}
+
+async function setLedOn() {
+    try {
+        const rgb = rgbFromHex(colorInp.value || '#ffa000');
+        const bri = Number(briInp.value || 20);
+        const led = await ledPut({ on: true, rgb, brightness: bri });
+        setLedStatusText(led);
+    } catch (e) {
+        if (ledStateEl) ledStateEl.textContent = 'LED setzen fehlgeschlagen';
+    }
+}
+async function setLedOff() {
+    try {
+        const led = await ledPut({ on: false });
+        setLedStatusText(led);
+    } catch (e) {
+        if (ledStateEl) ledStateEl.textContent = 'LED setzen fehlgeschlagen';
+    }
+}
+
+if (btnOn) btnOn.addEventListener('click', setLedOn);
+if (btnOff) btnOff.addEventListener('click', setLedOff);
+if (briInp) briInp.addEventListener('input', () => { briVal.textContent = String(briInp.value); });
+
+// Beim Laden einmal initial holen:
+refreshLedUI();
+
+// Optional: alle 3 Sekunden Status aktualisieren (falls jemand anderes /led ändert)
+setInterval(refreshLedUI, 3000);
 
 setInterval(poll, 1000);
 poll();

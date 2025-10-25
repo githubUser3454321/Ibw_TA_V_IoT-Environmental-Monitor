@@ -14,6 +14,13 @@ STATE = {
     "timestamp": now_iso()
 }
 
+LED = {
+    "on": False,
+    "rgb": [255, 160, 0],
+    "brightness": 20,
+    "updatedAt": None
+}
+
 def _clamp_float(v, lo, hi):
     try:
         v = float(v)
@@ -27,6 +34,11 @@ def _clamp_int_ge0(v):
     except Exception:
         return None
     return max(0, v)
+
+def _clamp_int(v, lo, hi):
+    try: v = int(v)
+    except: return None
+    return max(lo, min(hi, v))
 
 class Handler(SimpleHTTPRequestHandler):
     # zentrale Helfer
@@ -62,12 +74,16 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/telemetry":
             self._set_api_headers(200)
             self.wfile.write(json.dumps(STATE).encode("utf-8"))
-        else:
-            return super().do_GET()
+            return
+        if path == "/led":
+            self._set_api_headers(200)
+            self.wfile.write(json.dumps(LED).encode("utf-8"))
+            return
+        return super().do_GET()
 
     def do_PUT(self):
         path = urlparse(self.path).path
-        if path != "/telemetry":
+        if path not in ("/telemetry", "/led"):
             self._set_api_headers(404)
             self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
             return
@@ -91,23 +107,51 @@ class Handler(SimpleHTTPRequestHandler):
             lr = _clamp_int_ge0(light.get("raw"))
             ln = _clamp_float(light.get("norm"), 0.0, 1.0)
 
-        # --- Sanfte Migration: falls alte Sender 'axes' schicken, tolerieren ---
-        # (Optional: hier könnte man aus 'axes.z' eine Pseudo-Helligkeit ableiten.
-        # Wir ignorieren 'axes' standardmäßig, brechen aber nicht ab.)
-        # axes = payload.get("axes")
+        if path == "/telemetry":
+            ts = payload.get("timestamp", now_iso())
 
-        ts = payload.get("timestamp", now_iso())
+            # --- STATE aktualisieren (nur wenn Werte valide sind) ---
+            if temp is not None:
+                STATE["temperatureC"] = temp
+            if lr is not None or ln is not None:
+                STATE["light"]["raw"]  = STATE["light"]["raw"]  if lr is None else lr
+                STATE["light"]["norm"] = STATE["light"]["norm"] if ln is None else ln
+            STATE["timestamp"] = ts
+            self._set_api_headers(200)
+            self.wfile.write(json.dumps(STATE).encode("utf-8"))
+            return
+        if path == "/led":
+            on = payload.get("on", LED["on"])
+            rgb = payload.get("rgb", LED["rgb"])
+            bri = payload.get("brightness", LED["brightness"])
 
-        # --- STATE aktualisieren (nur wenn Werte valide sind) ---
-        if temp is not None:
-            STATE["temperatureC"] = temp
-        if lr is not None or ln is not None:
-            STATE["light"]["raw"]  = STATE["light"]["raw"]  if lr is None else lr
-            STATE["light"]["norm"] = STATE["light"]["norm"] if ln is None else ln
-        STATE["timestamp"] = ts
+            if not isinstance(on, bool):
+                self._set_api_headers(400)
+                self.wfile.write(json.dumps({"error": "on must be boolean"}).encode("utf-8"))
+                return
 
-        self._set_api_headers(200)
-        self.wfile.write(json.dumps(STATE).encode("utf-8"))
+            if (not isinstance(rgb, (list, tuple))) or len(rgb) != 3:
+                self._set_api_headers(400)
+                self.wfile.write(json.dumps({"error": "rgb must be [r,g,b]"}).encode("utf-8"))
+                return
+
+            r = _clamp_int(rgb[0], 0, 255)
+            g = _clamp_int(rgb[1], 0, 255)
+            b = _clamp_int(rgb[2], 0, 255)
+            bri = _clamp_int(bri, 0, 100)
+
+            if None in (r, g, b, bri):
+                self._set_api_headers(400)
+                self.wfile.write(json.dumps({"error": "invalid rgb/brightness"}).encode("utf-8"))
+                return
+
+            LED.update({"on": on, "rgb": [r, g, b], "brightness": bri, "updatedAt": now_iso()})
+            self._set_api_headers(200)
+            self.wfile.write(json.dumps(LED).encode("utf-8"))
+            return
+        self._set_api_headers(400)
+
+
 
 def run(host="localhost", port=8123):
     print(f"Serving on http://{host}:{port}  (GET/PUT /telemetry) + static files")
