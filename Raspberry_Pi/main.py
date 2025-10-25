@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from bleak import BleakClient, BleakScanner, BleakError
 import aiohttp
+import contextlib
 
 # --- Windows: Bleak mag den Selector-Loop ---
 if sys.platform.startswith("win"):
@@ -27,6 +28,8 @@ PITCH0_DEG = 75.0   # Y
 # API-Konfiguration
 API_BASE = "http://localhost:8123"
 API_TELEMETRY = f"{API_BASE}/telemetry"
+API_LED = f"{API_BASE}/led"
+
 
 # --- Parser: Tokens (optional, selten gebraucht)
 _TOKEN_RE = re.compile(
@@ -55,15 +58,6 @@ def _to_float_or_none(v: Optional[str]) -> Optional[float]:
         return float(v)
     except Exception:
         return None
-
-# ---- Orientierung aus Beschleunigung ----
-def _pitch_from_acc(ax: float, ay: float, az: float) -> float:
-    # ax, ay, az in m/s²; Pitch = Rotation um Y
-    return math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
-
-def _g_norm(ax: float, ay: float, az: float) -> float:
-    g = math.sqrt(ax*ax + ay*ay + az*az)
-    return g / 9.80665 if 9.80665 else g
 
 # ---- Dein gewünschtes Output-Format (unverändert) ----
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -154,6 +148,54 @@ async def stdin_to_queue(q: asyncio.Queue):
             await asyncio.sleep(0.05); continue
         await q.put(line.decode("utf-8", "ignore").strip())
 
+
+class LedWorker:
+    def __init__(self, http: aiohttp.ClientSession, client_write):
+        self.http = http
+        self.client_write = client_write  # async fn(data: bytes) -> None
+        self.last_applied = None
+        self.task = asyncio.create_task(self._run())
+
+    async def _fetch_desired(self):
+        try:
+            async with self.http.get(API_LED, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status != 200: return None
+                return await resp.json()
+        except Exception:
+            return None
+
+    async def _apply(self, desire):
+        # desire: {"on":bool,"rgb":[r,g,b],"brightness":0..100}
+        if not desire: return
+        if desire == self.last_applied: return  # nichts zu tun
+
+        if desire["on"]:
+            # Reihenfolge: Brightness dann Fill
+            bri = int(desire.get("brightness", 20))
+            r, g, b = map(int, desire.get("rgb", [255,160,0]))
+            await self.client_write(f"BRIGHT {bri}\n".encode("utf-8"))
+            await self.client_write(f"FILL {r} {g} {b}\n".encode("utf-8"))
+        else:
+            await self.client_write(b"OFF\n")
+
+        self.last_applied = dict(desire)
+
+    async def _run(self):
+        try:
+            while True:
+                desire = await self._fetch_desired()
+                await self._apply(desire)
+                await asyncio.sleep(0.3)  # 300 ms Polling
+        except asyncio.CancelledError:
+            pass
+
+    async def close(self):
+        self.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.task
+
+
+
 # --- PUT-Worker ---
 class PutWorker:
     def __init__(self, session: aiohttp.ClientSession, url: str, max_rate_hz: float = 10.0):
@@ -238,28 +280,37 @@ async def run():
                             loop.create_task(handle_parsed(line))
 
                     await client.start_notify(UART_TX_CHAR_UUID, handle_notify)
+                    async def _client_write(data: bytes):
+                        await client.write_gatt_char(UART_RX_CHAR_UUID, data, response=False)
+
+                    led_worker = LedWorker(http, _client_write) 
 
                     tx_q: asyncio.Queue[str] = asyncio.Queue()
                     stdin_task = asyncio.create_task(stdin_to_queue(tx_q))
                     print("Bereit. Beenden mit Ctrl+C")
-
-                    while client.is_connected and not stop_event.is_set():
-                        try:
+                    try:
+                        while client.is_connected and not stop_event.is_set():
                             try:
-                                cmd = await asyncio.wait_for(tx_q.get(), timeout=0.2)
-                                if cmd:
-                                    await client.write_gatt_char(UART_RX_CHAR_UUID, (cmd+"\n").encode("utf-8"), response=False)
-                                    print(f">> {cmd}")
-                            except asyncio.TimeoutError:
-                                pass
-                        except BleakError as e:
-                            print("BLE-Fehler:", e); break
-                        except Exception as e:
-                            print("Fehler:", e); break
+                                try:
+                                    cmd = await asyncio.wait_for(tx_q.get(), timeout=0.2)
+                                    if cmd:
+                                        await client.write_gatt_char(UART_RX_CHAR_UUID, (cmd+"\n").encode("utf-8"), response=False)
+                                        print(f">> {cmd}")
+                                except asyncio.TimeoutError:
+                                    pass
+                            except BleakError as e:
+                                print("BLE-Fehler:", e); break
+                            except Exception as e:
+                                print("Fehler:", e); break
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await client.stop_notify(UART_TX_CHAR_UUID)
+                        
+                        stdin_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await stdin_task
 
-                    try: await client.stop_notify(UART_TX_CHAR_UUID)
-                    except Exception: pass
-                    stdin_task.cancel()
+                    await led_worker.close()
 
             except BleakError as e:
                 print("Verbindungsfehler:", e)
