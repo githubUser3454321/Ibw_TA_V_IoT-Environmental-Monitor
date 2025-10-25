@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json
+import json, os
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-# --- Neues STATE-Schema: Temperatur + Licht ---
+# --- Runtime State im RAM ---
 STATE = {
     "temperatureC": 20.0,
     "light": {"raw": 0, "norm": 0.0},
@@ -36,12 +36,14 @@ def _clamp_int_ge0(v):
     return max(0, v)
 
 def _clamp_int(v, lo, hi):
-    try: v = int(v)
-    except: return None
+    try:
+        v = int(v)
+    except Exception:
+        return None
     return max(lo, min(hi, v))
 
 class Handler(SimpleHTTPRequestHandler):
-    # zentrale Helfer
+        # zentrale Helfer
     def _set_api_headers(self, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -50,7 +52,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
-    # >>> CORS auch für statische Module erlauben <<<
+    def _set_cors_headers_only(self, status=204):
+        self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def end_headers(self):
         if self.path.endswith((".js", ".mjs", ".css", ".glb", ".gltf", ".hdr")):
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -60,27 +68,33 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_OPTIONS(self):
         path = urlparse(self.path).path
-        if path == "/telemetry":
-            self._set_api_headers(204)
+        if path in ("/telemetry", "/led"):
+            self._set_cors_headers_only(204)
         else:
-            self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.end_headers()
+            self._set_cors_headers_only(204)
 
+    #
+    # GET
+    #
     def do_GET(self):
         path = urlparse(self.path).path
+
         if path == "/telemetry":
             self._set_api_headers(200)
             self.wfile.write(json.dumps(STATE).encode("utf-8"))
             return
+
         if path == "/led":
             self._set_api_headers(200)
             self.wfile.write(json.dumps(LED).encode("utf-8"))
             return
+
+        # alles andere: statische Dateien (index.html, app.js, styles.css, …)
         return super().do_GET()
 
+    #
+    # PUT
+    #
     def do_PUT(self):
         path = urlparse(self.path).path
         if path not in ("/telemetry", "/led"):
@@ -97,20 +111,20 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "invalid json", "detail": str(e)}).encode("utf-8"))
             return
 
-        # --- Temperatur clampen ---
-        temp = _clamp_float(payload.get("temperatureC", STATE["temperatureC"]), -20, 60)
-
-        # --- Licht lesen (neu) ---
-        light = payload.get("light", None)
-        lr = ln = None
-        if isinstance(light, dict):
-            lr = _clamp_int_ge0(light.get("raw"))
-            ln = _clamp_float(light.get("norm"), 0.0, 1.0)
-
+        # /telemetry -> Messwerte vom Pi
         if path == "/telemetry":
+            # Temperatur
+            temp = _clamp_float(payload.get("temperatureC", STATE["temperatureC"]), -20, 60)
+            # Licht
+            light = payload.get("light", None)
+            lr = ln = None
+            if isinstance(light, dict):
+                lr = _clamp_int_ge0(light.get("raw"))
+                ln = _clamp_float(light.get("norm"), 0.0, 1.0)
+
             ts = payload.get("timestamp", now_iso())
 
-            # --- STATE aktualisieren (nur wenn Werte valide sind) ---
+            # State wirklich updaten
             if temp is not None:
                 STATE["temperatureC"] = temp
             if lr is not None or ln is not None:
@@ -120,6 +134,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._set_api_headers(200)
             self.wfile.write(json.dumps(STATE).encode("utf-8"))
             return
+        # /led -> Sollzustand der LED (kommt von Webseite)
         if path == "/led":
             on = payload.get("on", LED["on"])
             rgb = payload.get("rgb", LED["rgb"])
@@ -145,16 +160,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "invalid rgb/brightness"}).encode("utf-8"))
                 return
 
-            LED.update({"on": on, "rgb": [r, g, b], "brightness": bri, "updatedAt": now_iso()})
+            LED.update({
+                "on": on,
+                "rgb": [r, g, b],
+                "brightness": bri,
+                "updatedAt": now_iso()
+            })
+
             self._set_api_headers(200)
             self.wfile.write(json.dumps(LED).encode("utf-8"))
             return
         self._set_api_headers(400)
 
-
-
-def run(host="localhost", port=8123):
-    print(f"Serving on http://{host}:{port}  (GET/PUT /telemetry) + static files")
+def run():
+    # Render.com gibt den Port oft als env PORT
+    port = int(os.environ.get("PORT", "8123"))
+    host = "0.0.0.0"  # wichtig: öffentlich erreichbar, nicht nur localhost
+    print(f"Serving on http://{host}:{port}")
     with HTTPServer((host, port), Handler) as httpd:
         try:
             httpd.serve_forever()
