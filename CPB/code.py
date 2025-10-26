@@ -347,7 +347,8 @@ while True:
             if uart.in_waiting:
                 raw = uart.read(uart.in_waiting)
                 if raw:
-                    rx_buf += raw.decode("utf-8", errors="ignore")
+                    # KEINE Keyword-Args bei decode()
+                    rx_buf += raw.decode("utf-8","ignore")
                     # Es kann mehrere Zeilen in einem Paket geben
                     while "\n" in rx_buf:
                         line, rx_buf = rx_buf.split("\n", 1)
