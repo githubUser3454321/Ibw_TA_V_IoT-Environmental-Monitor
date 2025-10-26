@@ -21,12 +21,9 @@ UART_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write (Pi -> CPB)
 UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify (CPB -> Pi)
 TARGET_NAME = "CPB_TA_V"
 
-# ---- Baseline (relative Orientierung beim Start) ----
-YAW0_DEG   = 0.0    # X
-PITCH0_DEG = 75.0   # Y
 
 # API-Konfiguration
-API_BASE = "http://localhost:8123"
+API_BASE = "https://ibw-ta-v-api.onrender.com"
 API_TELEMETRY = f"{API_BASE}/telemetry"
 API_LED = f"{API_BASE}/led"
 
