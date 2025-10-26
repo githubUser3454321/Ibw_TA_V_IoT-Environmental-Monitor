@@ -6,8 +6,8 @@ const lightRawVal = document.getElementById('lightRawVal');
 const lightNormVal = document.getElementById('lightNormVal');
 const tsVal = document.getElementById('tsVal');
 
-const API_URL = `${window.location.origin}/telemetry`;
-const LED_URL = `${window.location.origin}/led`;
+const API_URL = `https://ibw-ta-v-api.onrender.com/telemetry`;
+const LED_URL = `https://ibw-ta-v-api.onrender.com/led`;
 
 
 function setStatus(msg) { if (statusEl) statusEl.textContent = msg; }
