@@ -282,7 +282,7 @@ async def run():
                     async def _client_write(data: bytes):
                         async with tx_lock:
                             try:
-                                await client.write_gatt_char(UART_RX_CHAR_UUID, data, False)
+                                await client.write_gatt_char(UART_RX_CHAR_UUID, data, True)
                                 print(f"[BLE TX] {data!r}")
                             except Exception as e:
                                 print(f"[BLE TX ERROR] {e}")
@@ -299,7 +299,7 @@ async def run():
                                 try:
                                     cmd = await asyncio.wait_for(tx_q.get(), timeout=0.2)
                                     if cmd:
-                                        await client.write_gatt_char(UART_RX_CHAR_UUID, (cmd+"\n").encode("utf-8"), False)
+                                        await client.write_gatt_char(UART_RX_CHAR_UUID, (cmd+"\n").encode("utf-8"), True)
                                         print(f">> {cmd}")
                                 except asyncio.TimeoutError:
                                     pass
